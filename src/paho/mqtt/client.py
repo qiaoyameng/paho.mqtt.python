@@ -843,6 +843,7 @@ class Client:
         self._max_inflight_messages = 20
         self._inflight_messages = 0
         self._max_queued_messages = 0
+        self._coalesce_offline_retained = False
         self._connect_properties: Properties | None = None
         self._will_properties: Properties | None = None
         self._will = False
@@ -1075,6 +1076,34 @@ class Client:
             raise ValueError("Invalid queue size.")
 
         self._max_queued_messages = value
+
+    @property
+    def coalesce_offline_retained(self) -> bool:
+        """
+        If True, publishing a retained message supersedes any previously
+        queued retained message for the same topic that has not yet entered
+        the MQTT protocol exchange, keeping only the last retained state per
+        topic. This avoids replaying a large backlog of stale retained states
+        when reconnecting after a long offline period.
+
+        A queued message is only superseded if it has never been sent to the
+        broker. Messages that are already in flight (QoS 1/2 handshake in
+        progress, including messages awaiting retransmission after a
+        reconnect) and non-retained messages are never replaced. A retained
+        publish with an empty payload (retained delete) is a valid final
+        state and also supersedes earlier queued messages for the topic.
+
+        The `MQTTMessageInfo` of a superseded publish is marked as published
+        with rc `MQTT_ERR_SUCCESS`, so `is_published()` returns True and
+        `wait_for_publish()` returns instead of blocking forever.
+
+        Defaults to False.
+        """
+        return self._coalesce_offline_retained
+
+    @coalesce_offline_retained.setter
+    def coalesce_offline_retained(self, value: bool) -> None:
+        self._coalesce_offline_retained = bool(value)
 
     @property
     def will_topic(self) -> str | None:
@@ -1814,6 +1843,9 @@ class Client:
             message.properties = properties
 
             with self._out_message_mutex:
+                if retain and self._coalesce_offline_retained:
+                    self._coalesce_retained_offline(topic_bytes)
+
                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
                     return message.info
@@ -1844,6 +1876,28 @@ class Client:
                     message.state = mqtt_ms_queued
                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
                     return message.info
+
+    def _coalesce_retained_offline(self, topic: bytes) -> None:
+        """Supersede queued retained messages for `topic` that have not yet
+        entered the MQTT protocol exchange, marking them as published so
+        their `MQTTMessageInfo` reaches a terminal state.
+
+        Must be called with `_out_message_mutex` held.
+        """
+        superseded = []
+        for mid, queued in self._out_messages.items():
+            if (
+                queued.retain
+                and queued._topic == topic
+                and not queued.dup
+                and queued.state in (mqtt_ms_publish, mqtt_ms_queued)
+            ):
+                superseded.append(mid)
+
+        for mid in superseded:
+            queued = self._out_messages.pop(mid)
+            queued.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+            queued.info._set_as_published()
 
     def username_pw_set(
         self, username: str | None, password: str | None = None
