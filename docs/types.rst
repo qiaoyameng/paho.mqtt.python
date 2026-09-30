@@ -12,3 +12,10 @@ Types and enums
 .. automodule:: paho.mqtt.reasoncodes
    :members:
    :undoc-members:
+
+Session persistence
+===================
+
+.. automodule:: paho.mqtt.sessionstore
+   :members:
+   :undoc-members:

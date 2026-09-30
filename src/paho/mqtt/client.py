@@ -45,6 +45,12 @@ from .matcher import MQTTMatcher
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
+from .sessionstore import (
+    CorruptSessionError,
+    SessionStore,
+    apply_state_to_client,
+    snapshot_client,
+)
 
 try:
     from typing import Literal
@@ -709,6 +715,21 @@ class Client:
         if applications fails while processing a message, or while it pending
         locally.
 
+    :param SessionStore session_store: optional pluggable persistence backend
+        (see `paho.mqtt.sessionstore.SessionStore`, with a
+        `FileSessionStore` file-based reference implementation) that stores
+        the state needed to resume QoS 1/2 protocol exchanges after a process
+        restart: outstanding outgoing messages, incoming QoS 2 exchanges
+        between PUBREC and PUBREL, and the last allocated packet id.
+        State is restored on reconnect when the client requests a persistent
+        session (clean_session=False / clean_start False), and discarded when
+        the connection starts a clean session or the broker reports no
+        existing session (session present = 0). Corrupt stored state is
+        detected and dropped rather than half-restored. This resumes the
+        protocol exchanges (at-least-once semantics); it does not guarantee
+        that application side effects happen exactly once, so message
+        handlers must be idempotent.
+
     Callbacks
     =========
 
@@ -755,6 +776,7 @@ class Client:
         transport: Literal["tcp", "websockets", "unix"] = "tcp",
         reconnect_on_failure: bool = True,
         manual_ack: bool = False,
+        session_store: SessionStore | None = None,
     ) -> None:
         transport = transport.lower()  # type: ignore
         if transport == "unix" and not hasattr(socket, "AF_UNIX"):
@@ -764,6 +786,9 @@ class Client:
                 f'transport must be "websockets", "tcp" or "unix", not {transport}')
 
         self._manual_ack = manual_ack
+        if session_store is not None and not isinstance(session_store, SessionStore):
+            raise TypeError("session_store must be a paho.mqtt.sessionstore.SessionStore instance")
+        self._session_store: SessionStore | None = session_store
         self._transport = transport
         self._protocol = protocol
         self._userdata = userdata
@@ -1595,6 +1620,8 @@ class Client:
             self._last_bytes_received = time_func()
             self._last_msg_out = time_func()
 
+        self._restore_persisted_session()
+
         # Put messages in progress in a valid state.
         self._messages_reconnect_reset()
 
@@ -1839,11 +1866,11 @@ class Client:
                         message.state = mqtt_ms_publish
 
                     message.info.rc = rc
-                    return message.info
                 else:
                     message.state = mqtt_ms_queued
                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
-                    return message.info
+            self._persist_session()
+            return message.info
 
     def username_pw_set(
         self, username: str | None, password: str | None = None
@@ -3331,11 +3358,24 @@ class Client:
                 )
 
     def _mid_generate(self) -> int:
+        """Allocate the next free packet id.
+
+        Ids still part of an in-progress QoS 1/2 handshake (in either
+        ``_out_messages`` or ``_in_messages``, including state restored from
+        a session store after a restart) are skipped and never reused
+        [MQTT-2.2.1-2].
+        """
         with self._mid_generate_mutex:
-            self._last_mid += 1
-            if self._last_mid == 65536:
-                self._last_mid = 1
-            return self._last_mid
+            with self._out_message_mutex, self._in_message_mutex:
+                for _ in range(65535):
+                    self._last_mid += 1
+                    if self._last_mid == 65536:
+                        self._last_mid = 1
+                    if (self._last_mid not in self._out_messages
+                            and self._last_mid not in self._in_messages):
+                        return self._last_mid
+            raise RuntimeError(
+                "No free message id available: all 65535 ids are in use")
 
     @staticmethod
     def _raise_for_invalid_topic(topic: bytes) -> None:
@@ -3788,6 +3828,91 @@ class Client:
         self._messages_reconnect_reset_out()
         self._messages_reconnect_reset_in()
 
+    def _connect_will_be_clean(self) -> bool:
+        """Whether the CONNECT about to be sent starts a clean session.
+
+        Mirrors the connect flag computation in `_send_connect`.
+        """
+        if self._protocol == MQTTv5:
+            if self._clean_start == MQTT_CLEAN_START_FIRST_ONLY:
+                return self._mqttv5_first_connect
+            return bool(self._clean_start)
+        return bool(self._clean_session)
+
+    def _persist_session(self) -> None:
+        """Durably save the current session state when a store is configured.
+
+        Persisting protocol state only makes the QoS 1/2 exchanges
+        resumable; it does not provide exactly-once application delivery (see
+        the `paho.mqtt.sessionstore` module documentation).
+        """
+        if self._session_store is None:
+            return
+        try:
+            self._session_store.save(
+                self._client_id.decode("utf-8", errors="replace"),
+                snapshot_client(self),
+            )
+        except OSError as exc:
+            self._easy_log(
+                MQTT_LOG_WARNING, "Failed to persist session state: %s", exc)
+
+    def _clear_persisted_session(self) -> None:
+        """Delete persisted state; used when a clean session is started."""
+        if self._session_store is None:
+            return
+        try:
+            self._session_store.delete(
+                self._client_id.decode("utf-8", errors="replace"))
+        except OSError as exc:
+            self._easy_log(
+                MQTT_LOG_WARNING, "Failed to clear session state: %s", exc)
+
+    def _restore_persisted_session(self) -> None:
+        """Load or discard persisted state before sending CONNECT.
+
+        Called from `reconnect` on every connection attempt. When a clean
+        session is requested, persisted state is deleted. Otherwise the
+        stored state replaces the in-memory tables; if it cannot be decoded
+        or fails its integrity check, a fresh session is started rather than
+        risking a half-restored handshake.
+        """
+        if self._session_store is None:
+            return
+
+        client_id = self._client_id.decode("utf-8", errors="replace")
+        if self._connect_will_be_clean():
+            self._clear_persisted_session()
+            return
+
+        try:
+            state = self._session_store.load(client_id)
+        except CorruptSessionError as exc:
+            self._easy_log(
+                MQTT_LOG_WARNING,
+                "Discarding unreadable persisted session: %s",
+                exc,
+            )
+            self._clear_persisted_session()
+            return
+        except OSError as exc:
+            self._easy_log(
+                MQTT_LOG_WARNING,
+                "Could not read persisted session, starting fresh: %s",
+                exc,
+            )
+            return
+
+        if state is None:
+            return
+
+        apply_state_to_client(self, state)
+        self._easy_log(
+            MQTT_LOG_DEBUG,
+            "Restored persisted session: %d outgoing, %d incoming messages, last mid %d",
+            len(self._out_messages), len(self._in_messages), self._last_mid,
+        )
+
     def _packet_queue(
         self,
         command: int,
@@ -3986,11 +4111,23 @@ class Client:
 
         if result == 0:
             rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+            session_present = bool(flags & 0x01)
+            if not self._connect_will_be_clean() and not session_present:
+                # We requested a persistent session but the broker reports
+                # that none exists (expired, different broker, or the broker
+                # ignored our request): the broker does not know about any
+                # incoming QoS 2 exchange, so waiting for its PUBREL would
+                # hang forever. Drop the incoming half. Outgoing messages are
+                # re-sent from scratch below, which the broker accepts as new
+                # publications.
+                with self._in_message_mutex:
+                    self._in_messages.clear()
             with self._out_message_mutex:
                 for m in self._out_messages.values():
                     m.timestamp = time_func()
                     if m.state == mqtt_ms_queued:
                         self.loop_write()  # Process outgoing messages that have just been queued up
+                        self._persist_session()
                         return MQTT_ERR_SUCCESS
 
                     if m.qos == 0:
@@ -4047,6 +4184,8 @@ class Client:
                                 return rc
                     self.loop_write()  # Process outgoing messages that have just been queued up
 
+            if rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
+                self._persist_session()
             return rc
         elif result > 0 and result < 6:
             return MQTTErrorCode.MQTT_ERR_CONN_REFUSED
@@ -4069,6 +4208,7 @@ class Client:
         with self._out_message_mutex:
             retval = list(self._out_messages.values())
             self._out_messages.clear()
+        self._persist_session()
         return retval
 
     def _handle_disconnect(self) -> None:
@@ -4207,6 +4347,15 @@ class Client:
             else:
                 return self._send_puback(message.mid)
         elif message.qos == 2:
+            # A retransmitted PUBLISH for an exchange already awaiting
+            # PUBREL must be answered with a retransmission of PUBREC
+            # [MQTT-4.3.3-9] and must not run the application callback again
+            # at this point.
+            with self._in_message_mutex:
+                already_pending = message.mid in self._in_messages
+
+            if already_pending:
+                return self._send_pubrec(message.mid)
 
             rc = self._send_pubrec(message.mid)
 
@@ -4214,6 +4363,8 @@ class Client:
             with self._in_message_mutex:
                 self._in_messages[message.mid] = message
 
+            if rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
+                self._persist_session()
             return rc
         else:
             return MQTTErrorCode.MQTT_ERR_PROTOCOL
@@ -4259,23 +4410,24 @@ class Client:
         self._easy_log(MQTT_LOG_DEBUG, "Received PUBREL (Mid: %d)", mid)
 
         with self._in_message_mutex:
-            if mid in self._in_messages:
-                # Only pass the message on if we have removed it from the queue - this
-                # prevents multiple callbacks for the same message.
-                message = self._in_messages.pop(mid)
-                self._handle_on_message(message)
-                if self._max_inflight_messages > 0:
-                    with self._out_message_mutex:
-                        rc = self._update_inflight()
-                    if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
-                        return rc
+            message = self._in_messages.pop(mid, None)
 
-        # FIXME: this should only be done if the message is known
-        # If unknown it's a protocol error and we should close the connection.
-        # But since we don't have (on disk) persistence for the session, it
-        # is possible that we must known about this message.
-        # Choose to acknowledge this message (thus losing a message) but
-        # avoid hanging. See #284.
+        rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+        if message is not None:
+            # Only pass the message on once it has been removed from the
+            # queue, to prevent multiple callbacks for the same message.
+            self._handle_on_message(message)
+            if self._max_inflight_messages > 0:
+                with self._out_message_mutex:
+                    rc = self._update_inflight()
+            if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+                return rc
+            self._persist_session()
+
+        # Strictly speaking an unknown PUBREL is a protocol error and the
+        # connection should be closed, but the persisted state may have been
+        # lost (corrupt store, manual cleanup) and hanging the exchange is
+        # worse. Acknowledge it anyway. See #284.
         if self._manual_ack:
             return MQTTErrorCode.MQTT_ERR_SUCCESS
         else:
@@ -4324,14 +4476,17 @@ class Client:
                         self._in_packet['packet'][3:])
         self._easy_log(MQTT_LOG_DEBUG, "Received PUBREC (Mid: %d)", mid)
 
+        rc = MQTTErrorCode.MQTT_ERR_SUCCESS
         with self._out_message_mutex:
             if mid in self._out_messages:
                 msg = self._out_messages[mid]
                 msg.state = mqtt_ms_wait_for_pubcomp
                 msg.timestamp = time_func()
-                return self._send_pubrel(mid)
+                rc = self._send_pubrel(mid)
 
-        return MQTTErrorCode.MQTT_ERR_SUCCESS
+        if rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
+            self._persist_session()
+        return rc
 
     def _handle_unsuback(self) -> MQTTErrorCode:
         if self._protocol == MQTTv5:
@@ -4487,6 +4642,7 @@ class Client:
                 rc = self._update_inflight()
                 if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                     return rc
+            self._persist_session()
         return MQTTErrorCode.MQTT_ERR_SUCCESS
 
     def _handle_pubackcomp(
