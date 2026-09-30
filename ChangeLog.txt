@@ -1,3 +1,13 @@
+v2.1.1 - Unreleased
+===================
+
+- Add pluggable session state persistence (`paho.mqtt.persistence`) with a
+  file-based reference implementation (`FileSessionStore`). Unfinished
+  QoS 1/2 exchanges, inbound QoS 2 stages and packet id occupancy can now
+  survive a process restart; recovery honours the CONNACK session_present
+  flag and clean_start/clean_session.
+
+
 v2.1.0 - 2024-04-29
 ===================
 

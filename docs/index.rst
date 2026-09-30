@@ -17,6 +17,7 @@
 
    client
    helpers
+   persistence
    types
    changelog
    migrations
