@@ -45,6 +45,7 @@ from .matcher import MQTTMatcher
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
+from .subscription import SubscriptionHandle, SubscriptionState
 
 try:
     from typing import Literal
@@ -851,6 +852,19 @@ class Client:
         self._will_qos = 0
         self._will_retain = False
         self._on_message_filtered = MQTTMatcher()
+        # MQTT v5 subscription handles keyed by Subscription Identifier.
+        self._subscription_handles: dict[int, SubscriptionHandle] = {}
+        # Pending SUBSCRIBE/UNSUBSCRIBE requests keyed by packet mid. A new
+        # entry is created for each request and dropped as soon as the matching
+        # SUBACK/UNSUBACK arrives - or on (re)connect, so that a SUBACK
+        # delivered on a new connection can never activate a stale handle.
+        self._pending_subscriptions: dict[
+            int, list[SubscriptionHandle]
+        ] = collections.OrderedDict()
+        self._pending_unsubscriptions: dict[
+            int, list[SubscriptionHandle]
+        ] = collections.OrderedDict()
+        self._next_subscription_identifier = 1
         self._host = ""
         self._port = 1883
         self._bind_address = ""
@@ -1139,6 +1153,11 @@ class Client:
         """Close the connection to the server."""
         if not self._sock:
             return
+
+        # The connection is gone: any in-flight SUBACK/UNSUBACK is now stale
+        # and must never be mistaken for the confirmation of a subscription
+        # request issued on the next connection.
+        self._reset_pending_subscriptions()
 
         try:
             sock = self._sock
@@ -2106,7 +2125,197 @@ class Client:
         if self._sock is None:
             return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
 
-        return self._send_unsubscribe(False, topic_list, properties)
+        with self._callback_mutex:
+            affected_handles: list[SubscriptionHandle] = []
+            if self._protocol == MQTTv5:
+                # Revoking a subscription by topic also revokes any handle
+                # registered for the exact same filter. The handlers stay
+                # active until the UNSUBACK arrives (see _handle_unsuback).
+                seen = set()
+                for raw_topic in topic_list:
+                    topic_filter = raw_topic.decode('utf-8')
+                    for handle in self._subscription_handles.values():
+                        if (handle.topic == topic_filter
+                                and handle.identifier not in seen):
+                            seen.add(handle.identifier)
+                            affected_handles.append(handle)
+
+        result, mid = self._send_unsubscribe(
+            False, topic_list, properties)
+        if (result == MQTTErrorCode.MQTT_ERR_SUCCESS
+                and mid is not None and affected_handles):
+            with self._callback_mutex:
+                self._pending_unsubscriptions[mid] = affected_handles
+        return (result, mid)
+
+    def subscribe_handle(
+        self,
+        topic: str,
+        callback: CallbackOnMessage,
+        qos: int = 0,
+        identifier: int | None = None,
+        properties: Properties | None = None,
+    ) -> SubscriptionHandle:
+        """Create an MQTT v5.0 subscription handle for *topic*.
+
+        The SUBSCRIBE packet carries a Subscription Identifier property which
+        the broker echoes back in every PUBLISH matching the subscription.
+        Incoming messages are then routed directly to *callback* through the
+        returned :class:`SubscriptionHandle`, even when several modules
+        subscribe to overlapping topic filters.
+
+        The handler is **not** active until the broker accepts the
+        subscription: a success reason code in SUBACK activates it, whereas a
+        failure reason code leaves it inactive. Messages carrying the
+        identifier before the SUBACK (a misbehaving peer) are not delivered to
+        the handler. Use
+        ``SubscriptionHandle.state`` / ``SubscriptionHandle.is_active()`` to
+        check the status, or the existing `on_subscribe` callback.
+
+        :param str topic: the subscription topic filter.
+        :param callback: message callback with the same signature as
+            `on_message`: ``callback(client, userdata, message)``.
+        :param int qos: the requested quality of service level (0, 1 or 2).
+        :param int identifier: the Subscription Identifier to use. It must be
+            between 1 and 268435455 and not already in use by another handle
+            of this client. If ``None`` (the default), the client allocates
+            the next unused identifier automatically.
+        :param Properties properties: extra MQTT v5.0 properties to include in
+            the SUBSCRIBE packet. A Subscription Identifier property must not
+            already be set, it is added by this method.
+        :return: the created :class:`SubscriptionHandle`.
+        :raises ValueError: on invalid arguments or duplicated identifier.
+        :raises RuntimeError: when the protocol is not MQTT v5.0.
+        """
+        if self._protocol != MQTTv5:
+            raise RuntimeError(
+                "Subscription handles require MQTT version 5.0.")
+        if not isinstance(topic, (bytes, str)) or len(topic) == 0:
+            raise ValueError('Invalid topic.')
+        if callback is None:
+            raise ValueError("callback must be defined.")
+        if qos < 0 or qos > 2:
+            raise ValueError('Invalid QoS level.')
+        topic_bytes = (topic.encode('utf-8')
+                       if isinstance(topic, str) else topic)
+        if self._filter_wildcard_len_check(topic_bytes) != MQTT_ERR_SUCCESS:
+            raise ValueError('Invalid subscription filter.')
+        if properties is not None and hasattr(
+                properties, 'SubscriptionIdentifier'):
+            raise ValueError(
+                "Do not set the Subscription Identifier property manually, "
+                "use the identifier parameter instead.")
+
+        with self._callback_mutex:
+            if identifier is None:
+                while (self._next_subscription_identifier
+                        in self._subscription_handles):
+                    self._next_subscription_identifier += 1
+                identifier = self._next_subscription_identifier
+                self._next_subscription_identifier += 1
+            else:
+                if not 1 <= identifier <= 268435455:
+                    raise ValueError(
+                        "Subscription identifier must be in the range "
+                        "1-268435455.")
+                if identifier in self._subscription_handles:
+                    raise ValueError(
+                        f"Subscription identifier {identifier} is already in "
+                        "use.")
+
+            handle = SubscriptionHandle(
+                self,
+                topic if isinstance(topic, str) else topic.decode('utf-8'),
+                identifier,
+                callback,
+                qos,
+            )
+            self._subscription_handles[identifier] = handle
+
+        sub_properties = (properties if properties is not None
+                          else Properties(PacketTypes.SUBSCRIBE))
+        sub_properties.SubscriptionIdentifier = identifier
+
+        result, mid = self.subscribe(topic, qos=qos, properties=sub_properties)
+        if result == MQTTErrorCode.MQTT_ERR_SUCCESS and mid is not None:
+            with self._callback_mutex:
+                self._pending_subscriptions[mid] = [handle]
+        else:
+            # Could not even send the SUBSCRIBE (no connection...): the
+            # handle stays registered but inactive, ready to be armed again
+            # with resubscribe_handle() after reconnecting.
+            handle._state = SubscriptionState.INACTIVE
+        return handle
+
+    def resubscribe_handle(
+        self,
+        handle: SubscriptionHandle,
+        properties: Properties | None = None,
+    ) -> tuple[MQTTErrorCode, int | None]:
+        """Re-arm an existing subscription handle after a reconnect.
+
+        Re-sends the SUBSCRIBE packet for *handle* with its original
+        Subscription Identifier and sets the handle back to the pending state.
+        The handler is only activated when the **new** SUBACK arrives; any
+        SUBACK left over from the previous connection can never activate it
+        because pending requests are cleared when the connection is lost.
+
+        :param handle: the handle returned by `subscribe_handle()`.
+        :param properties: extra MQTT v5.0 properties for the SUBSCRIBE
+            packet.
+        :return: the ``(result, mid)`` tuple returned by `subscribe()`.
+        """
+        if self._protocol != MQTTv5:
+            raise RuntimeError(
+                "Subscription handles require MQTT version 5.0.")
+        if handle._client is not self:
+            raise ValueError("Handle does not belong to this client.")
+        if properties is not None and hasattr(
+                properties, 'SubscriptionIdentifier'):
+            raise ValueError(
+                "Do not set the Subscription Identifier property manually.")
+
+        sub_properties = (properties if properties is not None
+                          else Properties(PacketTypes.SUBSCRIBE))
+        sub_properties.SubscriptionIdentifier = handle.identifier
+        result, mid = self.subscribe(
+            handle.topic, qos=handle.qos, properties=sub_properties)
+        if result == MQTTErrorCode.MQTT_ERR_SUCCESS and mid is not None:
+            with self._callback_mutex:
+                handle._state = SubscriptionState.PENDING
+                handle.reason_code = None
+                self._subscription_handles[handle.identifier] = handle
+                self._pending_subscriptions[mid] = [handle]
+        return (result, mid)
+
+    def unsubscribe_handle(
+        self,
+        handle: SubscriptionHandle,
+        properties: Properties | None = None,
+    ) -> tuple[MQTTErrorCode, int | None]:
+        """Unsubscribe the topic of *handle* and revoke the handler.
+
+        The UNSUBSCRIBE packet is sent immediately, but the handle stays
+        active until the broker acknowledges the removal in the UNSUBACK
+        packet, so that in-flight messages keep being delivered. Once the
+        removal is acknowledged the identifier is released and the handle
+        becomes inactive.
+
+        :param handle: the handle returned by `subscribe_handle()`.
+        :param properties: MQTT v5.0 properties for the UNSUBSCRIBE packet.
+        :return: the ``(result, mid)`` tuple returned by `unsubscribe()`.
+        """
+        if self._protocol != MQTTv5:
+            raise RuntimeError(
+                "Subscription handles require MQTT version 5.0.")
+        if handle._client is not self:
+            raise ValueError("Handle does not belong to this client.")
+
+        result, mid = self.unsubscribe(handle.topic, properties=properties)
+        if result == MQTTErrorCode.MQTT_ERR_SUCCESS and mid is not None:
+            with self._callback_mutex:
+                self._pending_unsubscriptions[mid] = [handle]
+        return (result, mid)
 
     def loop_read(self, max_packets: int = 1) -> MQTTErrorCode:
         """Process read network events. Use in place of calling `loop()` if you
@@ -4094,6 +4303,91 @@ class Client:
             properties=properties,
         )
 
+    def _activate_subscription_handles(
+        self, mid: int, reasoncodes: list[ReasonCode]
+    ) -> None:
+        """Activate or deactivate subscription handles once a SUBACK arrives.
+
+        Only the handles linked to *this* SUBSCRIBE packet (looked up by mid)
+        are touched. Pending requests are removed from the pending map on
+        every reconnect, so a SUBACK arriving on a fresh connection can never
+        match a request issued on the previous one.
+        """
+        with self._callback_mutex:
+            handles = self._pending_subscriptions.pop(mid, None)
+            if handles is None:
+                # SUBACK for a plain subscribe() call, or a stale SUBACK
+                # arriving after a reconnect.
+                return
+
+            for index, handle in enumerate(handles):
+                if index >= len(reasoncodes):
+                    # Malformed peer: fewer reason codes than subscriptions.
+                    handle._state = SubscriptionState.INACTIVE
+                    continue
+                reason = reasoncodes[index]
+                handle.reason_code = reason
+                if reason <= 2:
+                    # Success / Granted QoS 0..2
+                    handle._qos = reason.value
+                    handle._state = SubscriptionState.ACTIVE
+                    self._subscription_handles[handle.identifier] = handle
+                else:
+                    # Any reason code >= 0x80 means the broker rejected the
+                    # subscription: the handler must not be activated. It
+                    # stays registered (but inactive) so the same handle can
+                    # be retried with resubscribe_handle().
+                    handle._state = SubscriptionState.INACTIVE
+
+    def _revoke_subscription_handles(
+        self, mid: int, reasoncodes: list[ReasonCode] | None = None
+    ) -> None:
+        """Revoke subscription handles once an UNSUBACK arrives.
+
+        On MQTT v5.0 a failure reason code (>= 0x80) means the broker did not
+        remove the subscription, so the handle is left untouched (and active
+        if it was). On MQTT v3 there are no reason codes and the removal is
+        always considered successful.
+        """
+        with self._callback_mutex:
+            handles = self._pending_unsubscriptions.pop(mid, None)
+            if handles is None:
+                return
+
+            for index, handle in enumerate(handles):
+                if (reasoncodes is not None
+                        and index < len(reasoncodes)
+                        and reasoncodes[index] >= 0x80):
+                    # The broker refused the unsubscription, keep the handler.
+                    continue
+                handle._state = SubscriptionState.INACTIVE
+                self._subscription_handles.pop(handle.identifier, None)
+
+    def _reset_pending_subscriptions(self) -> None:
+        """Invalidate in-flight subscription requests on (re)connection.
+
+        Any handle waiting for a SUBACK/UNSUBACK becomes inactive and the
+        pending maps are cleared. Consequently an old SUBACK (even one that
+        was delayed until after the reconnect) cannot be mistaken for the
+        confirmation of a new SUBSCRIBE: the application must re-arm the
+        handles with `resubscribe_handle()` from its `on_connect` callback.
+        """
+        if not hasattr(self, '_pending_subscriptions'):
+            return
+        with self._callback_mutex:
+            for handles in self._pending_subscriptions.values():
+                for handle in handles:
+                    handle._state = SubscriptionState.INACTIVE
+            for handles in self._pending_unsubscriptions.values():
+                for handle in handles:
+                    # An unconfirmed unsubscribe is rolled back: keep the
+                    # handle registered but inactive pending a fresh SUBACK.
+                    handle._state = SubscriptionState.INACTIVE
+            self._pending_subscriptions.clear()
+            self._pending_unsubscriptions.clear()
+            for handle in self._subscription_handles.values():
+                handle._state = SubscriptionState.INACTIVE
+
     def _handle_suback(self) -> None:
         self._easy_log(MQTT_LOG_DEBUG, "Received SUBACK")
         pack_format = f"!H{len(self._in_packet['packet']) - 2}s"
@@ -4108,6 +4402,8 @@ class Client:
             granted_qos = struct.unpack(pack_format, packet)
             reasoncodes = [ReasonCode(SUBACK >> 4, identifier=c) for c in granted_qos]
             properties = Properties(SUBACK >> 4)
+
+        self._activate_subscription_handles(mid, reasoncodes)
 
         with self._callback_mutex:
             on_subscribe = self.on_subscribe
@@ -4354,6 +4650,8 @@ class Client:
             properties = Properties(UNSUBACK >> 4)
 
         self._easy_log(MQTT_LOG_DEBUG, "Received UNSUBACK (Mid: %d)", mid)
+        self._revoke_subscription_handles(
+            mid, reasoncodes_list if self._protocol == MQTTv5 else None)
         with self._callback_mutex:
             on_unsubscribe = self.on_unsubscribe
 
@@ -4526,17 +4824,41 @@ class Client:
         except UnicodeDecodeError:
             topic = None
 
-        on_message_callbacks = []
+        subscription_callbacks: list[CallbackOnMessage] = []
+        topic_callbacks: list[CallbackOnMessage] = []
         with self._callback_mutex:
-            if topic is not None:
-                on_message_callbacks = list(self._on_message_filtered.iter_match(message.topic))
+            # 1. MQTT v5 Subscription Identifier handlers. The broker decides
+            #    which subscriptions matched and may return the same
+            #    identifier, or several identifiers pointing at the same
+            #    handler, more than once; each handler callback is invoked
+            #    at most once, in the order given by the broker.
+            #    Pending/inactive handles - including messages arriving
+            #    before the SUBACK - are ignored.
+            if self._protocol == MQTTv5 and message.properties is not None \
+                    and hasattr(message.properties, 'SubscriptionIdentifier'):
+                invoked_callbacks = set()
+                for identifier in message.properties.SubscriptionIdentifier:
+                    handle = self._subscription_handles.get(identifier)
+                    if (handle is not None
+                            and handle.is_active()
+                            and handle.callback not in invoked_callbacks):
+                        invoked_callbacks.add(handle.callback)
+                        subscription_callbacks.append(handle.callback)
 
-            if len(on_message_callbacks) == 0:
+            # 2. Topic filter callbacks registered with message_callback_add().
+            if topic is not None:
+                topic_callbacks = list(
+                    self._on_message_filtered.iter_match(message.topic))
+
+            # 3. The default on_message callback is only used when no topic
+            #    filter callback matched. It is independent from the
+            #    subscription identifier handlers, which never suppress it.
+            if len(topic_callbacks) == 0:
                 on_message = self.on_message
             else:
                 on_message = None
 
-        for callback in on_message_callbacks:
+        for callback in subscription_callbacks + topic_callbacks:
             with self._in_callback_mutex:
                 try:
                     callback(self, self._userdata, message)

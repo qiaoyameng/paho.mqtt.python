@@ -1,3 +1,14 @@
+v2.1.1 - unreleased
+===================
+
+- Add MQTT v5 Subscription Identifier support via `subscribe_handle()`:
+  `SubscriptionHandle` routes messages to a module callback, activated only
+  after a successful SUBACK and revoked on SUBACK failure, unsubscribe or
+  disconnect. Multiple identifiers in one PUBLISH are deduplicated per
+  handler. Reconnected clients can re-arm handles with
+  `resubscribe_handle()`; stale SUBACK packets from a previous connection
+  never activate them.
+
 v2.1.0 - 2024-04-29
 ===================
 
