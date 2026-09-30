@@ -843,6 +843,7 @@ class Client:
         self._max_inflight_messages = 20
         self._inflight_messages = 0
         self._max_queued_messages = 0
+        self._retained_offline_coalescing = False
         self._connect_properties: Properties | None = None
         self._will_properties: Properties | None = None
         self._will = False
@@ -1075,6 +1076,34 @@ class Client:
             raise ValueError("Invalid queue size.")
 
         self._max_queued_messages = value
+
+    @property
+    def retained_offline_coalescing(self) -> bool:
+        """
+        Coalesce retained messages that are still waiting in the outgoing queue.
+
+        When enabled, publishing a retained message discards any previously
+        queued retained message for the same topic that has not started its
+        protocol handshake yet (i.e. its PUBLISH packet was never sent to the
+        broker). Only the last retained state per topic is kept, which avoids
+        re-sending a large backlog of stale retained states after a reconnect.
+
+        Non-retained messages and messages already in flight (QoS 1/2
+        handshake in progress) are never discarded. A retained message with
+        an empty payload (retained delete) is a valid final state and also
+        replaces older queued states for its topic.
+
+        The `MQTTMessageInfo` of a discarded message is marked as published,
+        so `is_published()` returns True and `wait_for_publish()` does not
+        block.
+
+        Defaults to False.
+        """
+        return self._retained_offline_coalescing
+
+    @retained_offline_coalescing.setter
+    def retained_offline_coalescing(self, value: bool) -> None:
+        self._retained_offline_coalescing = bool(value)
 
     @property
     def will_topic(self) -> str | None:
@@ -1814,6 +1843,9 @@ class Client:
             message.properties = properties
 
             with self._out_message_mutex:
+                if self._retained_offline_coalescing and retain:
+                    self._drop_superseded_retained(topic_bytes)
+
                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
                     message.info.rc = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
                     return message.info
@@ -1844,6 +1876,28 @@ class Client:
                     message.state = mqtt_ms_queued
                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
                     return message.info
+
+    def _drop_superseded_retained(self, topic: bytes) -> None:
+        # Drop queued retained messages for topic that have not started their
+        # protocol handshake yet. Must be called with _out_message_mutex held.
+        for mid in [
+            mid
+            for mid, queued in self._out_messages.items()
+            if queued.retain
+            and queued._topic == topic
+            and queued.state in (mqtt_ms_publish, mqtt_ms_queued)
+        ]:
+            superseded = self._out_messages.pop(mid)
+            self._easy_log(
+                MQTT_LOG_DEBUG,
+                "Dropping superseded retained message (m%d) on topic '%s'",
+                mid,
+                topic,
+            )
+            # Give the dropped message a queryable terminal state: it will
+            # never be sent, but the last retained state for its topic will.
+            superseded.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+            superseded.info._set_as_published()
 
     def username_pw_set(
         self, username: str | None, password: str | None = None
@@ -2211,6 +2265,12 @@ class Client:
         if not isinstance(queue_size, int):
             raise ValueError('Invalid type of queue size.')
         self.max_queued_messages = queue_size
+        return self
+
+    def retained_offline_coalescing_set(self, enabled: bool) -> Client:
+        """Enable or disable coalescing of queued retained messages.
+        See the `retained_offline_coalescing` property for details."""
+        self.retained_offline_coalescing = enabled
         return self
 
     def user_data_set(self, userdata: Any) -> None:

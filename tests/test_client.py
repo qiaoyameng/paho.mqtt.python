@@ -1170,3 +1170,89 @@ class TestLargeDownload:
         finally:
             mqttc.loop_stop()
             fake_broker.finish()
+
+
+class TestRetainedOfflineCoalescing:
+    """
+    Tests for the optional coalescing of queued retained messages that have
+    not started their protocol handshake yet.
+    """
+
+    def _client(self) -> client.Client:
+        return client.Client(CallbackAPIVersion.VERSION2, "coalesce-test")
+
+    def test_disabled_by_default(self) -> None:
+        mqttc = self._client()
+
+        mqttc.publish("dev/a", "1", qos=1, retain=True)
+        mqttc.publish("dev/a", "2", qos=1, retain=True)
+
+        assert len(mqttc._out_messages) == 2
+
+    def test_coalesces_to_last_state_per_topic(self) -> None:
+        mqttc = self._client()
+        mqttc.retained_offline_coalescing = True
+
+        mqttc.publish("dev/a", "a1", qos=1, retain=True)
+        mqttc.publish("dev/b", "b1", qos=1, retain=True)
+        mqttc.publish("dev/a", "a2", qos=1, retain=True)
+
+        queued = list(mqttc._out_messages.values())
+        assert [(m.topic, m.payload) for m in queued] == [("dev/b", b"b1"), ("dev/a", b"a2")]
+
+    def test_coalesced_info_has_terminal_state(self) -> None:
+        mqttc = self._client()
+        mqttc.retained_offline_coalescing = True
+
+        superseded = mqttc.publish("dev/a", "a1", qos=1, retain=True)
+        survivor = mqttc.publish("dev/a", "a2", qos=1, retain=True)
+
+        # The dropped message must not wait forever: it is marked published.
+        assert superseded.is_published()
+        superseded.wait_for_publish(0.5)
+        assert superseded.rc == MQTTErrorCode.MQTT_ERR_SUCCESS
+
+        assert survivor.mid in mqttc._out_messages
+
+    def test_empty_payload_retained_delete_is_valid_final_state(self) -> None:
+        mqttc = self._client()
+        mqttc.retained_offline_coalescing = True
+
+        mqttc.publish("dev/a", "a1", qos=1, retain=True)
+        mqttc.publish("dev/a", "", qos=1, retain=True)
+
+        queued = list(mqttc._out_messages.values())
+        assert len(queued) == 1
+        assert queued[0].payload == b""
+        assert queued[0].retain
+
+    def test_non_retained_messages_are_not_coalesced(self) -> None:
+        mqttc = self._client()
+        mqttc.retained_offline_coalescing = True
+
+        mqttc.publish("dev/a", "1", qos=1)
+        mqttc.publish("dev/a", "2", qos=1)
+
+        assert len(mqttc._out_messages) == 2
+
+    def test_inflight_messages_are_not_coalesced(self) -> None:
+        mqttc = self._client()
+        mqttc.retained_offline_coalescing = True
+
+        inflight = mqttc.publish("dev/a", "a1", qos=1, retain=True)
+        # Simulate a message whose QoS handshake has already started.
+        mqttc._out_messages[inflight.mid].state = client.mqtt_ms_wait_for_puback
+
+        mqttc.publish("dev/a", "a2", qos=1, retain=True)
+
+        assert len(mqttc._out_messages) == 2
+        assert inflight.mid in mqttc._out_messages
+
+    def test_setter_method(self) -> None:
+        mqttc = self._client()
+
+        assert mqttc.retained_offline_coalescing_set(True) is mqttc
+        assert mqttc.retained_offline_coalescing is True
+
+        mqttc.retained_offline_coalescing = False
+        assert mqttc.retained_offline_coalescing is False
