@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import copy
 import errno
 import hashlib
 import logging
@@ -642,6 +643,153 @@ class MQTTMessage:
         self._topic = value
 
 
+class TopicAliasManager:
+    """Manage MQTT v5.0 topic aliases for one network connection."""
+
+    __slots__ = (
+        "_lock",
+        "_incoming_maximum",
+        "_outgoing_maximum",
+        "_incoming_aliases",
+        "_outgoing_aliases",
+        "_outgoing_topics",
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._incoming_maximum = 0
+        self._outgoing_maximum = 0
+        self._incoming_aliases: dict[int, bytes] = {}
+        self._outgoing_aliases: collections.OrderedDict[int, bytes] = collections.OrderedDict()
+        self._outgoing_topics: dict[bytes, int] = {}
+
+    def reset(self) -> None:
+        """Remove all aliases associated with the current network connection."""
+        with self._lock:
+            self._incoming_aliases.clear()
+            self._outgoing_aliases.clear()
+            self._outgoing_topics.clear()
+
+    def configure_connection(
+        self,
+        connect_properties: Properties | None,
+    ) -> tuple[int, Properties | None]:
+        """Prepare mappings and return the incoming limit to send in CONNECT."""
+        properties = connect_properties
+        if connect_properties is None or not hasattr(connect_properties, "TopicAliasMaximum"):
+            if connect_properties is None:
+                properties = Properties(PacketTypes.CONNECT)
+            else:
+                properties = copy.copy(connect_properties)
+            properties.TopicAliasMaximum = 65535
+
+        incoming_maximum = properties.TopicAliasMaximum
+
+        with self._lock:
+            self.reset()
+            self._incoming_maximum = incoming_maximum
+            self._outgoing_maximum = 0
+
+        return incoming_maximum, properties
+
+    def set_outgoing_maximum(self, maximum: int) -> None:
+        """Record the outgoing limit received from the broker in CONNACK."""
+        with self._lock:
+            self._outgoing_maximum = maximum
+            self._outgoing_aliases.clear()
+            self._outgoing_topics.clear()
+
+    def resolve_outgoing(
+        self,
+        topic: bytes,
+        properties: Properties | None,
+    ) -> tuple[bytes, Properties | None]:
+        """Return the topic and properties to put on the wire."""
+        with self._lock:
+            explicit_alias = None
+            if properties is not None and hasattr(properties, "TopicAlias"):
+                explicit_alias = properties.TopicAlias
+
+            if explicit_alias is not None and not 1 <= explicit_alias <= self._outgoing_maximum:
+                raise ValueError("TopicAlias is outside the broker TopicAliasMaximum.")
+
+            if len(topic) == 0:
+                if explicit_alias is None:
+                    raise ValueError("An empty topic requires a TopicAlias.")
+                if explicit_alias not in self._outgoing_aliases:
+                    raise ValueError("TopicAlias has not been established on this connection.")
+                self._outgoing_aliases.move_to_end(explicit_alias)
+                return b"", self._properties_with_alias(properties, explicit_alias)
+
+            if explicit_alias is not None:
+                established_topic = self._outgoing_aliases.get(explicit_alias)
+                self._bind_outgoing_alias(topic, explicit_alias)
+                if established_topic == topic:
+                    return b"", self._properties_with_alias(properties, explicit_alias)
+                return topic, self._properties_with_alias(properties, explicit_alias)
+
+            alias = self._outgoing_topics.get(topic)
+            if alias is not None:
+                reused_alias = alias
+                self._outgoing_aliases.move_to_end(reused_alias)
+                return b"", self._properties_with_alias(properties, reused_alias)
+
+            if self._outgoing_maximum == 0:
+                return topic, properties
+
+            alias = self._allocate_outgoing_alias()
+            self._bind_outgoing_alias(topic, alias)
+            return topic, self._properties_with_alias(properties, alias)
+
+    def resolve_incoming(self, topic: bytes, alias: int | None) -> bytes | None:
+        """Resolve an incoming PUBLISH topic, updating the incoming map."""
+        with self._lock:
+            if alias is not None and not 1 <= alias <= self._incoming_maximum:
+                return None
+
+            if len(topic) > 0:
+                if alias is not None:
+                    self._incoming_aliases[alias] = topic
+                return topic
+
+            if alias is None or alias not in self._incoming_aliases:
+                return None
+
+            return self._incoming_aliases[alias]
+
+    def _bind_outgoing_alias(self, topic: bytes, alias: int) -> None:
+        old_topic = self._outgoing_aliases.get(alias)
+        if old_topic is not None:
+            self._outgoing_topics.pop(old_topic, None)
+
+        old_alias = self._outgoing_topics.get(topic)
+        if old_alias is not None and old_alias != alias:
+            self._outgoing_aliases.pop(old_alias, None)
+
+        self._outgoing_aliases[alias] = topic
+        self._outgoing_aliases.move_to_end(alias)
+        self._outgoing_topics[topic] = alias
+
+    def _allocate_outgoing_alias(self) -> int:
+        for alias in range(1, self._outgoing_maximum + 1):
+            if alias not in self._outgoing_aliases:
+                return alias
+
+        alias, _old_topic = next(iter(self._outgoing_aliases.items()))
+        return alias
+
+    @staticmethod
+    def _properties_with_alias(
+        properties: Properties | None,
+        alias: int,
+    ) -> Properties:
+        publish_properties = Properties(PacketTypes.PUBLISH)
+        if properties is not None:
+            publish_properties = copy.copy(properties)
+        publish_properties.TopicAlias = alias
+        return publish_properties
+
+
 class Client:
     """MQTT version 3.1/3.1.1/5.0 client class.
 
@@ -709,6 +857,10 @@ class Client:
         if applications fails while processing a message, or while it pending
         locally.
 
+    :param TopicAliasManager topic_alias_manager: enable automatic MQTT v5.0 topic alias
+        management. The manager uses the broker's CONNACK TopicAliasMaximum for outgoing
+        messages and keeps incoming aliases separately.
+
     Callbacks
     =========
 
@@ -755,6 +907,7 @@ class Client:
         transport: Literal["tcp", "websockets", "unix"] = "tcp",
         reconnect_on_failure: bool = True,
         manual_ack: bool = False,
+        topic_alias_manager: TopicAliasManager | None = None,
     ) -> None:
         transport = transport.lower()  # type: ignore
         if transport == "unix" and not hasattr(socket, "AF_UNIX"):
@@ -764,6 +917,7 @@ class Client:
                 f'transport must be "websockets", "tcp" or "unix", not {transport}')
 
         self._manual_ack = manual_ack
+        self._topic_alias_manager = topic_alias_manager
         self._transport = transport
         self._protocol = protocol
         self._userdata = userdata
@@ -795,7 +949,11 @@ class Client:
         if protocol == MQTTv5:
             if clean_session is not None:
                 raise ValueError('Clean session is not used for MQTT 5.0')
+            if topic_alias_manager is not None and not isinstance(topic_alias_manager, TopicAliasManager):
+                raise TypeError('topic_alias_manager must be a TopicAliasManager.')
         else:
+            if topic_alias_manager is not None:
+                raise ValueError('Topic aliases are only available with MQTT 5.0.')
             if clean_session is None:
                 clean_session = True
             if not clean_session and (client_id == "" or client_id is None):
@@ -1143,6 +1301,8 @@ class Client:
         try:
             sock = self._sock
             self._sock = None
+            if self._topic_alias_manager is not None:
+                self._topic_alias_manager.reset()
             self._call_socket_unregister_write(sock)
             self._call_socket_close(sock)
         finally:
@@ -3419,6 +3579,9 @@ class Client:
         if self._sock is None:
             return MQTTErrorCode.MQTT_ERR_NO_CONN
 
+        if self._protocol == MQTTv5 and self._topic_alias_manager is not None:
+            topic, properties = self._topic_alias_manager.resolve_outgoing(topic, properties)
+
         command = PUBLISH | ((dup & 0x1) << 3) | (qos << 1) | retain
         packet = bytearray()
         packet.append(command)
@@ -3532,10 +3695,15 @@ class Client:
                 remaining_length += 2 + len(self._password)
 
         if self._protocol == MQTTv5:
-            if self._connect_properties is None:
+            connect_properties = self._connect_properties
+            if self._topic_alias_manager is not None:
+                _incoming_maximum, connect_properties = self._topic_alias_manager.configure_connection(
+                    connect_properties
+                )
+            if connect_properties is None:
                 packed_connect_properties = b'\x00'
             else:
-                packed_connect_properties = self._connect_properties.pack()
+                packed_connect_properties = connect_properties.pack()
             remaining_length += len(packed_connect_properties)
             if self._will:
                 if self._will_properties is None:
@@ -3893,6 +4061,9 @@ class Client:
                 reason = ReasonCode(CONNACK >> 4, identifier=result)
                 properties = Properties(CONNACK >> 4)
                 properties.unpack(self._in_packet['packet'][2:])
+                if self._topic_alias_manager is not None:
+                    topic_alias_maximum = getattr(properties, "TopicAliasMaximum", 0)
+                    self._topic_alias_manager.set_outgoing_maximum(topic_alias_maximum)
                 if hasattr(properties, "ServerKeepAlive"):
                     # MQTT 5.0: when the server returns a Server Keep Alive in
                     # CONNACK, the client must use that value instead of the one
@@ -4178,6 +4349,16 @@ class Client:
             message.properties = Properties(PUBLISH >> 4)
             _props, props_len = message.properties.unpack(packet)
             packet = packet[props_len:]
+            topic_alias = getattr(message.properties, "TopicAlias", None)
+            if self._topic_alias_manager is not None:
+                topic = self._topic_alias_manager.resolve_incoming(topic, topic_alias)
+                if topic is None:
+                    return MQTTErrorCode.MQTT_ERR_PROTOCOL
+                message.topic = topic
+                try:
+                    print_topic = topic.decode('utf-8')
+                except UnicodeDecodeError:
+                    print_topic = f"TOPIC WITH INVALID UTF-8: {topic!r}"
 
         message.payload = packet
 
