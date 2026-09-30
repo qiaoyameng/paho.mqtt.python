@@ -45,6 +45,7 @@ from .matcher import MQTTMatcher
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
 from .subscribeoptions import SubscribeOptions
+from .topicalias import TopicAliasManager
 
 try:
     from typing import Literal
@@ -845,6 +846,11 @@ class Client:
         self._max_queued_messages = 0
         self._connect_properties: Properties | None = None
         self._will_properties: Properties | None = None
+        # Outgoing topic alias manager (opt-in, MQTT v5 only) and the
+        # independently maintained incoming alias -> topic mapping. Both are
+        # only valid for the lifetime of a network connection.
+        self._topic_alias_manager: TopicAliasManager | None = None
+        self._topic_alias_recv: dict[int, bytes] = {}
         self._will = False
         self._will_topic = b""
         self._will_payload: bytes | bytearray = b""
@@ -1800,8 +1806,9 @@ class Client:
 
         if qos == 0:
             info = MQTTMessageInfo(local_mid)
+            send_topic, send_properties = self._apply_topic_alias(topic_bytes, properties)
             rc = self._send_publish(
-                local_mid, topic_bytes, local_payload, qos, retain, False, info, properties)
+                local_mid, send_topic, local_payload, qos, retain, False, info, send_properties)
             info.rc = rc
             return info
         else:
@@ -1830,8 +1837,9 @@ class Client:
                     elif qos == 2:
                         message.state = mqtt_ms_wait_for_pubrec
 
-                    rc = self._send_publish(message.mid, topic_bytes, message.payload, message.qos, message.retain,
-                                            message.dup, message.info, message.properties)
+                    send_topic, send_properties = self._apply_topic_alias(topic_bytes, message.properties)
+                    rc = self._send_publish(message.mid, send_topic, message.payload, message.qos, message.retain,
+                                            message.dup, message.info, send_properties)
 
                     # remove from inflight messages so it will be send after a connection is made
                     if rc == MQTTErrorCode.MQTT_ERR_NO_CONN:
@@ -1882,6 +1890,57 @@ class Client:
         be used to create a bridge between multiple broker.
         """
         self._client_mode = MQTT_BRIDGE
+
+    def enable_topic_alias(self, maximum: int = 10) -> None:
+        """Enable automatic use of MQTT v5 topic aliases when publishing.
+
+        When enabled, the client keeps track of the topics published on the
+        current network connection and sends a Topic Alias instead of the
+        full topic name whenever possible, reducing bandwidth for long topic
+        names. The first publish of a topic always carries the full topic
+        name; later publishes of the same topic may omit it.
+
+        :param int maximum: the maximum number of topic aliases to use. The
+            effective limit is the minimum of this value and the Topic Alias
+            Maximum sent by the broker in the CONNACK. If the broker does not
+            allow aliases, none are used.
+
+        Aliases are only valid for the lifetime of a network connection: the
+        mapping is reset automatically on every (re)connect, so a publish
+        after a reconnect always starts with the full topic name again.
+
+        If a publish explicitly sets the ``TopicAlias`` property, the explicit
+        value takes precedence: the full topic is sent with it, the alias
+        manager adopts that mapping (dropping any conflicting automatic
+        assignment), and a ``ValueError`` is raised if the alias exceeds the
+        usable maximum.
+
+        Only has an effect when using MQTT v5. Incoming topic aliases are
+        always resolved, regardless of this setting.
+        """
+        self._topic_alias_manager = TopicAliasManager(maximum)
+
+    def disable_topic_alias(self) -> None:
+        """Disable automatic use of MQTT v5 topic aliases when publishing.
+
+        See `enable_topic_alias()`.
+        """
+        self._topic_alias_manager = None
+
+    def _apply_topic_alias(
+        self, topic: bytes, properties: Properties | None
+    ) -> tuple[bytes, Properties | None]:
+        # Aliases are only applied to a publish that is sent right now on an
+        # established MQTT v5 connection. Queued or retransmitted messages
+        # are always sent with their full topic, which is always valid.
+        if (
+            self._topic_alias_manager is None
+            or self._protocol != MQTTv5
+            or self._state != _ConnectionState.MQTT_CS_CONNECTED
+            or len(topic) == 0
+        ):
+            return topic, properties
+        return self._topic_alias_manager.apply(topic, properties)
 
     def _connection_closed(self) -> bool:
         """
@@ -3930,6 +3989,15 @@ class Client:
             self._state = _ConnectionState.MQTT_CS_CONNECTED
             self._reconnect_delay = None
 
+            # Topic aliases are only valid for the lifetime of a network
+            # connection, so (re)initialise both directions on every connect.
+            broker_topic_alias_maximum = 0
+            if properties is not None and hasattr(properties, "TopicAliasMaximum"):
+                broker_topic_alias_maximum = properties.TopicAliasMaximum
+            if self._topic_alias_manager is not None:
+                self._topic_alias_manager.reset(broker_topic_alias_maximum)
+            self._topic_alias_recv.clear()
+
         if self._protocol == MQTTv5:
             self._easy_log(
                 MQTT_LOG_DEBUG, "Received CONNACK (%s, %s) properties=%s", flags, reason, properties)
@@ -4178,6 +4246,26 @@ class Client:
             message.properties = Properties(PUBLISH >> 4)
             _props, props_len = message.properties.unpack(packet)
             packet = packet[props_len:]
+
+            # Resolve a topic alias using the incoming mapping, which is
+            # maintained independently of the outgoing alias manager.
+            if hasattr(message.properties, "TopicAlias"):
+                alias = message.properties.TopicAlias
+                if len(topic) > 0:
+                    # A non-empty topic (re)binds the alias on this connection.
+                    self._topic_alias_recv[alias] = topic
+                else:
+                    topic = self._topic_alias_recv.get(alias, b"")
+                    if len(topic) == 0:
+                        # Alias used before it was ever bound on this connection.
+                        return MQTTErrorCode.MQTT_ERR_PROTOCOL
+                    message.topic = topic
+                    try:
+                        print_topic = topic.decode('utf-8')
+                    except UnicodeDecodeError:
+                        print_topic = f"TOPIC WITH INVALID UTF-8: {topic!r}"
+            elif len(topic) == 0:
+                return MQTTErrorCode.MQTT_ERR_PROTOCOL
 
         message.payload = packet
 

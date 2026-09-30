@@ -1157,13 +1157,14 @@ class Test(_TestBase):
         self.assertTrue(topicalias > 0)
         self.assertEqual(msgs[0]["message"].topic, topics[0])
 
+        # The client resolves the alias, so the full topic is delivered.
         self.assertEqual(
             msgs[1]["message"].properties.TopicAlias, topicalias)
-        self.assertEqual(msgs[1]["message"].topic, "")
+        self.assertEqual(msgs[1]["message"].topic, topics[0])
 
         self.assertEqual(
             msgs[2]["message"].properties.TopicAlias, topicalias)
-        self.assertEqual(msgs[2]["message"].topic, "")
+        self.assertEqual(msgs[2]["message"].topic, topics[0])
 
         serverTopicAliasMaximum = 0  # no server topic alias allowed
         connect_properties = Properties(PacketTypes.CONNECT)
