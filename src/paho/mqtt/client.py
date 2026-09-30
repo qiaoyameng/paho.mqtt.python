@@ -82,6 +82,18 @@ if TYPE_CHECKING:
         packet: bytes | bytearray
         info: MQTTMessageInfo | None
 
+
+    class _PendingSubscription(TypedDict):
+        epoch: int
+        filters: list[str]
+        handle: "SubscriptionHandle"
+
+
+    class _PendingUnsubscription(TypedDict):
+        epoch: int
+        filters: list[str]
+        handle: "SubscriptionHandle | None"
+
     class SocketLike(Protocol):
         def recv(self, buffer_size: int) -> bytes:
             ...
@@ -642,6 +654,70 @@ class MQTTMessage:
         self._topic = value
 
 
+class SubscriptionHandle:
+    """An MQTT v5.0 subscription whose callback is tied to a Subscription Identifier.
+
+    The callback is not active until the broker returns a successful SUBACK
+    reason code for the corresponding filter. A successful UNSUBACK removes
+    the affected filters from the active set.
+    """
+
+    __slots__ = ("_active_topics", "_callback", "_client", "_matcher", "subscription_identifier")
+
+    def __init__(
+        self,
+        client: "Client",
+        subscription_identifier: int,
+        callback: CallbackOnMessage,
+    ) -> None:
+        self._client = client
+        self.subscription_identifier = subscription_identifier
+        self._callback = callback
+        self._active_topics: set[str] = set()
+        self._matcher = MQTTMatcher()
+
+    @property
+    def active(self) -> bool:
+        """True when at least one topic in this subscription is active."""
+        return len(self._active_topics) > 0
+
+    @property
+    def active_topics(self) -> set[str]:
+        """Topic filters activated by successful SUBACK responses."""
+        return set(self._active_topics)
+
+    def _matches(self, topic: str) -> bool:
+        return next(self._matcher.iter_match(topic), None) is not None
+
+    def _add_topic(self, topic_filter: str) -> None:
+        self._active_topics.add(topic_filter)
+        self._matcher[topic_filter] = True
+
+    def _discard_topic(self, topic_filter: str) -> None:
+        self._active_topics.discard(topic_filter)
+        try:
+            del self._matcher[topic_filter]
+        except KeyError:
+            pass
+
+    def _clear_topics(self) -> None:
+        for topic_filter in list(self._active_topics):
+            self._discard_topic(topic_filter)
+
+    def unsubscribe(
+        self, properties: Properties | None = None
+    ) -> tuple[MQTTErrorCode, int | None]:
+        """Unsubscribe active and pending filters in this subscription.
+
+        The callback remains active for each filter until the corresponding
+        UNSUBACK is received.
+        """
+        return self._client._unsubscribe_handle(self, properties)
+
+
+SubscriptionHandler = SubscriptionHandle
+
+
 class Client:
     """MQTT version 3.1/3.1.1/5.0 client class.
 
@@ -851,6 +927,10 @@ class Client:
         self._will_qos = 0
         self._will_retain = False
         self._on_message_filtered = MQTTMatcher()
+        self._subscription_handles: dict[int, SubscriptionHandle] = {}
+        self._pending_subscriptions: dict[int, _PendingSubscription] = {}
+        self._pending_unsubscriptions: dict[int, _PendingUnsubscription] = {}
+        self._subscription_epoch = 0
         self._host = ""
         self._port = 1883
         self._bind_address = ""
@@ -1597,6 +1677,7 @@ class Client:
 
         # Put messages in progress in a valid state.
         self._messages_reconnect_reset()
+        self._subscriptions_reconnect_reset(clean_session=False)
 
         with self._callback_mutex:
             on_pre_connect = self.on_pre_connect
@@ -1920,6 +2001,67 @@ class Client:
 
         return self._send_disconnect(reasoncode, properties)
 
+    def _normalize_subscribe_topics(
+        self,
+        topic: str | tuple[str, int] | tuple[str, SubscribeOptions] | list[tuple[str, int]] | list[tuple[str, SubscribeOptions]],
+        qos: int,
+        options: SubscribeOptions | None,
+    ) -> list[tuple[str, SubscribeOptions | int]]:
+        topic_qos_list: list[tuple[str, SubscribeOptions | int]] | None = None
+
+        if isinstance(topic, tuple):
+            if self._protocol == MQTTv5:
+                topic, options = topic
+                if not isinstance(options, SubscribeOptions):
+                    raise ValueError(
+                        'Subscribe options must be instance of SubscribeOptions class.')
+            else:
+                topic, qos = topic
+
+        if isinstance(topic, (bytes, str)):
+            if qos < 0 or qos > 2:
+                raise ValueError('Invalid QoS level.')
+            if self._protocol == MQTTv5:
+                if options is None:
+                    options = SubscribeOptions(qos=qos)
+                elif qos != 0:
+                    raise ValueError(
+                        'Subscribe options and qos parameters cannot be combined.')
+                if not isinstance(options, SubscribeOptions):
+                    raise ValueError(
+                        'Subscribe options must be instance of SubscribeOptions class.')
+                topic_qos_list = [(topic, options)]
+            else:
+                if topic is None or len(topic) == 0:
+                    raise ValueError('Invalid topic.')
+                topic_qos_list = [(topic, qos)]
+        elif isinstance(topic, list):
+            if len(topic) == 0:
+                raise ValueError('Empty topic list')
+            topic_qos_list = []
+            if self._protocol == MQTTv5:
+                for t, option in topic:
+                    if not isinstance(option, SubscribeOptions):
+                        if option < 0 or option > 2:
+                            raise ValueError('Invalid QoS level.')
+                        option = SubscribeOptions(qos=option)
+                    topic_qos_list.append((t, option))
+            else:
+                for t, qos_value in topic:
+                    if isinstance(qos_value, SubscribeOptions) or qos_value < 0 or qos_value > 2:
+                        raise ValueError('Invalid QoS level.')
+                    if t is None or len(t) == 0 or not isinstance(t, (bytes, str)):
+                        raise ValueError('Invalid topic.')
+                    topic_qos_list.append((t, qos_value))
+
+        if topic_qos_list is None:
+            raise ValueError("No topic specified, or incorrect topic type.")
+
+        if any(self._filter_wildcard_len_check(topic.encode('utf-8')) != MQTT_ERR_SUCCESS for topic, _ in topic_qos_list):
+            raise ValueError('Invalid subscription filter.')
+
+        return topic_qos_list
+
     def subscribe(
         self,
         topic: str | tuple[str, int] | tuple[str, SubscribeOptions] | list[tuple[str, int]] | list[tuple[str, SubscribeOptions]],
@@ -2006,65 +2148,111 @@ class Client:
         Raises a ValueError if qos is not 0, 1 or 2, or if topic is None or has
         zero string length, or if topic is not a string, tuple or list.
         """
-        topic_qos_list = None
-
-        if isinstance(topic, tuple):
-            if self._protocol == MQTTv5:
-                topic, options = topic  # type: ignore
-                if not isinstance(options, SubscribeOptions):
-                    raise ValueError(
-                        'Subscribe options must be instance of SubscribeOptions class.')
-            else:
-                topic, qos = topic  # type: ignore
-
-        if isinstance(topic, (bytes, str)):
-            if qos < 0 or qos > 2:
-                raise ValueError('Invalid QoS level.')
-            if self._protocol == MQTTv5:
-                if options is None:
-                    # if no options are provided, use the QoS passed instead
-                    options = SubscribeOptions(qos=qos)
-                elif qos != 0:
-                    raise ValueError(
-                        'Subscribe options and qos parameters cannot be combined.')
-                if not isinstance(options, SubscribeOptions):
-                    raise ValueError(
-                        'Subscribe options must be instance of SubscribeOptions class.')
-                topic_qos_list = [(topic.encode('utf-8'), options)]
-            else:
-                if topic is None or len(topic) == 0:
-                    raise ValueError('Invalid topic.')
-                topic_qos_list = [(topic.encode('utf-8'), qos)]  # type: ignore
-        elif isinstance(topic, list):
-            if len(topic) == 0:
-                raise ValueError('Empty topic list')
-            topic_qos_list = []
-            if self._protocol == MQTTv5:
-                for t, o in topic:
-                    if not isinstance(o, SubscribeOptions):
-                        # then the second value should be QoS
-                        if o < 0 or o > 2:
-                            raise ValueError('Invalid QoS level.')
-                        o = SubscribeOptions(qos=o)
-                    topic_qos_list.append((t.encode('utf-8'), o))
-            else:
-                for t, q in topic:
-                    if isinstance(q, SubscribeOptions) or q < 0 or q > 2:
-                        raise ValueError('Invalid QoS level.')
-                    if t is None or len(t) == 0 or not isinstance(t, (bytes, str)):
-                        raise ValueError('Invalid topic.')
-                    topic_qos_list.append((t.encode('utf-8'), q))  # type: ignore
-
-        if topic_qos_list is None:
-            raise ValueError("No topic specified, or incorrect topic type.")
-
-        if any(self._filter_wildcard_len_check(topic) != MQTT_ERR_SUCCESS for topic, _ in topic_qos_list):
-            raise ValueError('Invalid subscription filter.')
+        topic_qos_list = self._normalize_subscribe_topics(topic, qos, options)
 
         if self._sock is None:
             return (MQTT_ERR_NO_CONN, None)
 
-        return self._send_subscribe(False, topic_qos_list, properties)
+        topic_qos_bytes = [(topic.encode('utf-8'), option) for topic, option in topic_qos_list]
+        rc, mid, _ = self._send_subscribe(False, topic_qos_bytes, properties)
+        return rc, mid
+
+    def subscribe_with_id(
+        self,
+        subscription_identifier: int,
+        topic: str | tuple[str, int] | tuple[str, SubscribeOptions] | list[tuple[str, int]] | list[tuple[str, SubscribeOptions]],
+        callback: CallbackOnMessage,
+        qos: int = 0,
+        options: SubscribeOptions | None = None,
+        properties: Properties | None = None,
+    ) -> tuple[MQTTErrorCode, int | None, SubscriptionHandle]:
+        """Subscribe with an MQTT v5.0 Subscription Identifier and message callback.
+
+        The returned handle starts inactive. Its callback receives a message
+        only after a successful SUBACK and when the broker-provided identifier
+        and topic both correspond to one of its active filters. If a PUBLISH
+        contains several identifiers for the same handle, the callback is run
+        once.
+
+        Handle callbacks run before callbacks registered with
+        ``message_callback_add()``. If topic callbacks match, the default
+        ``on_message`` callback is not run, preserving the existing topic
+        callback behavior; otherwise it runs after the handle callbacks.
+        """
+        if self._protocol != MQTTv5:
+            raise ValueError("Subscription identifiers require MQTT version 5.")
+        if isinstance(subscription_identifier, bool) or not isinstance(subscription_identifier, int) or not 1 <= subscription_identifier <= 268_435_455:
+            raise ValueError("Subscription identifier must be in the range 1-268435455.")
+        if callback is None:
+            raise ValueError("callback must be defined.")
+        if properties is not None and hasattr(properties, "SubscriptionIdentifier"):
+            existing_identifiers = properties.SubscriptionIdentifier
+            if existing_identifiers != [subscription_identifier]:
+                raise ValueError("properties.SubscriptionIdentifier does not match subscription_identifier.")
+
+        topic_qos_list = self._normalize_subscribe_topics(topic, qos, options)
+
+        with self._callback_mutex:
+            handle = self._subscription_handles.get(subscription_identifier)
+            if handle is not None and handle._callback is not callback:
+                raise ValueError("Subscription identifier is already assigned to another callback.")
+            if handle is None:
+                handle = SubscriptionHandle(self, subscription_identifier, callback)
+                self._subscription_handles[subscription_identifier] = handle
+
+        if self._sock is None:
+            return (MQTT_ERR_NO_CONN, None, handle)
+
+        if properties is None:
+            subscribe_properties = Properties(PacketTypes.SUBSCRIBE)
+        else:
+            subscribe_properties = properties
+            if hasattr(subscribe_properties, "SubscriptionIdentifier"):
+                object.__setattr__(
+                    subscribe_properties,
+                    "SubscriptionIdentifier",
+                    [subscription_identifier],
+                )
+        if not hasattr(subscribe_properties, "SubscriptionIdentifier"):
+            subscribe_properties.SubscriptionIdentifier = subscription_identifier
+
+        topic_qos_bytes = [(topic_filter.encode('utf-8'), option) for topic_filter, option in topic_qos_list]
+        return self._send_subscribe(
+            False,
+            topic_qos_bytes,
+            subscribe_properties,
+            pending_handle=handle,
+            pending_filters=[topic_filter for topic_filter, _ in topic_qos_list],
+        )
+
+    subscribe_handler = subscribe_with_id
+    subscribe_with_identifier = subscribe_with_id
+
+    def _unsubscribe_handle(
+        self,
+        handle: SubscriptionHandle,
+        properties: Properties | None = None,
+    ) -> tuple[MQTTErrorCode, int | None]:
+        with self._callback_mutex:
+            topics = list(handle._active_topics)
+            for pending in self._pending_subscriptions.values():
+                if pending["handle"] is handle:
+                    topics.extend(topic for topic in pending["filters"] if topic not in topics)
+
+        if not topics:
+            return (MQTTErrorCode.MQTT_ERR_SUCCESS, None)
+
+        topic_list = [topic.encode('utf-8') for topic in topics]
+        if self._sock is None:
+            return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
+
+        return self._send_unsubscribe(
+            False,
+            topic_list,
+            properties,
+            pending_filters=topics,
+            pending_handle=handle,
+        )
 
     def unsubscribe(
         self, topic: str | list[str], properties: Properties | None = None
@@ -2106,7 +2294,9 @@ class Client:
         if self._sock is None:
             return (MQTTErrorCode.MQTT_ERR_NO_CONN, None)
 
-        return self._send_unsubscribe(False, topic_list, properties)
+        topic_filters = [topic.decode('utf-8') for topic in topic_list]
+        return self._send_unsubscribe(
+            False, topic_list, properties, pending_filters=topic_filters, pending_handle=None)
 
     def loop_read(self, max_packets: int = 1) -> MQTTErrorCode:
         """Process read network events. Use in place of calling `loop()` if you
@@ -3649,7 +3839,9 @@ class Client:
         dup: int,
         topics: Sequence[tuple[bytes, SubscribeOptions | int]],
         properties: Properties | None = None,
-    ) -> tuple[MQTTErrorCode, int]:
+        pending_handle: SubscriptionHandle | None = None,
+        pending_filters: list[str] | None = None,
+    ) -> tuple[MQTTErrorCode, int, SubscriptionHandle | None]:
         remaining_length = 2
         if self._protocol == MQTTv5:
             if properties is None:
@@ -3684,13 +3876,23 @@ class Client:
             local_mid,
             topics,
         )
-        return (self._packet_queue(command, packet, local_mid, 1), local_mid)
+        rc = self._packet_queue(command, packet, local_mid, 1)
+        if pending_handle is not None and pending_filters is not None and rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
+            with self._callback_mutex:
+                self._pending_subscriptions[local_mid] = {
+                    "epoch": self._subscription_epoch,
+                    "filters": pending_filters,
+                    "handle": pending_handle,
+                }
+        return (rc, local_mid, pending_handle)
 
     def _send_unsubscribe(
         self,
         dup: int,
         topics: list[bytes],
         properties: Properties | None = None,
+        pending_filters: list[str] | None = None,
+        pending_handle: SubscriptionHandle | None = None,
     ) -> tuple[MQTTErrorCode, int]:
         remaining_length = 2
         if self._protocol == MQTTv5:
@@ -3733,7 +3935,15 @@ class Client:
                 local_mid,
                 topics,
             )
-        return (self._packet_queue(command, packet, local_mid, 1), local_mid)
+        rc = self._packet_queue(command, packet, local_mid, 1)
+        if pending_filters is not None and rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
+            with self._callback_mutex:
+                self._pending_unsubscriptions[local_mid] = {
+                    "epoch": self._subscription_epoch,
+                    "filters": pending_filters,
+                    "handle": pending_handle,
+                }
+        return (rc, local_mid)
 
     def _check_clean_session(self) -> bool:
         if self._protocol == MQTTv5:
@@ -3787,6 +3997,20 @@ class Client:
     def _messages_reconnect_reset(self) -> None:
         self._messages_reconnect_reset_out()
         self._messages_reconnect_reset_in()
+
+    def _subscriptions_reconnect_reset(self, clean_session: bool) -> None:
+        with self._callback_mutex:
+            self._pending_subscriptions.clear()
+            self._pending_unsubscriptions.clear()
+            if clean_session:
+                for handle in self._subscription_handles.values():
+                    handle._clear_topics()
+                self._subscription_handles.clear()
+
+    def _subscription_connection_established(self, clean_session: bool) -> None:
+        self._subscriptions_reconnect_reset(clean_session=clean_session)
+        with self._callback_mutex:
+            self._subscription_epoch += 1
 
     def _packet_queue(
         self,
@@ -3929,6 +4153,7 @@ class Client:
         if result == 0:
             self._state = _ConnectionState.MQTT_CS_CONNECTED
             self._reconnect_delay = None
+            self._subscription_connection_established((flags & 0x01) == 0)
 
         if self._protocol == MQTTv5:
             self._easy_log(
@@ -4108,6 +4333,22 @@ class Client:
             granted_qos = struct.unpack(pack_format, packet)
             reasoncodes = [ReasonCode(SUBACK >> 4, identifier=c) for c in granted_qos]
             properties = Properties(SUBACK >> 4)
+
+        with self._callback_mutex:
+            pending = self._pending_subscriptions.get(mid)
+            if pending is not None and pending["epoch"] == self._subscription_epoch:
+                if len(pending["filters"]) == len(reasoncodes):
+                    self._pending_subscriptions.pop(mid, None)
+                    for topic_filter, reasoncode in zip(pending["filters"], reasoncodes):
+                        if reasoncode.is_failure:
+                            pending["handle"]._discard_topic(topic_filter)
+                        else:
+                            pending["handle"]._add_topic(topic_filter)
+                else:
+                    pending = None
+            elif pending is not None:
+                self._pending_subscriptions.pop(mid, None)
+                pending = None
 
         with self._callback_mutex:
             on_subscribe = self.on_subscribe
@@ -4355,6 +4596,27 @@ class Client:
 
         self._easy_log(MQTT_LOG_DEBUG, "Received UNSUBACK (Mid: %d)", mid)
         with self._callback_mutex:
+            pending = self._pending_unsubscriptions.get(mid)
+            if pending is not None and pending["epoch"] == self._subscription_epoch:
+                if self._protocol != MQTTv5 or len(pending["filters"]) == len(reasoncodes_list):
+                    self._pending_unsubscriptions.pop(mid, None)
+                    successful_filters = {
+                        topic_filter
+                        for topic_filter, reasoncode in zip(pending["filters"], reasoncodes_list)
+                        if not reasoncode.is_failure
+                    }
+                    if self._protocol != MQTTv5:
+                        successful_filters = set(pending["filters"])
+                    for topic_filter in successful_filters:
+                        for handle in self._subscription_handles.values():
+                            if pending["handle"] in (None, handle):
+                                handle._discard_topic(topic_filter)
+                else:
+                    pending = None
+            elif pending is not None:
+                self._pending_unsubscriptions.pop(mid, None)
+
+        with self._callback_mutex:
             on_unsubscribe = self.on_unsubscribe
 
         if on_unsubscribe:
@@ -4520,21 +4782,47 @@ class Client:
         return MQTTErrorCode.MQTT_ERR_SUCCESS
 
     def _handle_on_message(self, message: MQTTMessage) -> None:
-
         try:
             topic = message.topic
         except UnicodeDecodeError:
             topic = None
 
         on_message_callbacks = []
+        subscription_handles = []
         with self._callback_mutex:
             if topic is not None:
                 on_message_callbacks = list(self._on_message_filtered.iter_match(message.topic))
+            if self._protocol == MQTTv5 and message.properties is not None and hasattr(message.properties, "SubscriptionIdentifier"):
+                active_handles = set()
+                for subscription_identifier in message.properties.SubscriptionIdentifier:
+                    handle = self._subscription_handles.get(subscription_identifier)
+                    if (
+                        handle is not None
+                        and topic is not None
+                        and handle._matches(topic)
+                        and handle not in active_handles
+                    ):
+                        subscription_handles.append(handle)
+                        active_handles.add(handle)
 
             if len(on_message_callbacks) == 0:
                 on_message = self.on_message
             else:
                 on_message = None
+
+        for handle in subscription_handles:
+            with self._in_callback_mutex:
+                try:
+                    handle._callback(self, self._userdata, message)
+                except Exception as err:
+                    self._easy_log(
+                        MQTT_LOG_ERR,
+                        'Caught exception in subscription identifier %s callback: %s',
+                        handle.subscription_identifier,
+                        err
+                    )
+                    if not self.suppress_exceptions:
+                        raise
 
         for callback in on_message_callbacks:
             with self._in_callback_mutex:

@@ -317,6 +317,35 @@ Subscriber example
     mqttc.loop_forever()
     print(f"Received the following message: {mqttc.user_data_get()}")
 
+Subscription Identifier callbacks
+'''''''''''''''''''''''''''''''''
+
+MQTT 5 supports overlapping subscriptions in one message.  When multiple
+modules can match the same topic, subscribe with an explicit Subscription
+Identifier and keep the returned handle.  The handle callback is active only
+after a successful SUBACK and is revoked when the corresponding UNSUBACK is
+received.
+
+Handle callbacks are invoked first.  Existing ``message_callback_add()``
+callbacks are then invoked in their existing order.  If one or more topic
+callbacks match, ``on_message`` remains suppressed as before; otherwise
+``on_message`` is invoked after the handle callbacks.  Duplicate identifiers
+in one PUBLISH invoke the same handle callback only once.
+
+.. code:: python
+
+    import paho.mqtt.client as mqtt
+    from paho.mqtt.enums import CallbackAPIVersion
+
+    client = mqtt.Client(CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
+
+    def on_temperature(received_client, userdata, message):
+        pass
+
+    rc, mid, handle = client.subscribe_with_id(
+        7, "sensors/+/temperature", on_temperature, qos=1)
+    rc, mid = handle.unsubscribe()
+
 publisher example
 '''''''''''''''''
 
